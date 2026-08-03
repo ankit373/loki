@@ -308,6 +308,15 @@ func RecordRangeAndInstantQueryMetrics(
 		}
 	}
 
+	// sampleOrder is the query's resolved sample execution order (empty when the query has no
+	// decomposable range aggregation); "none" keeps the log field present and greppable.
+	sampleOrder := sampleOrderLabel(stats.Summary.StreamFirstSubqueries, stats.Summary.TimestampFirstSubqueries)
+	orderLogValue := sampleOrder
+	if orderLogValue == "" {
+		orderLogValue = "none"
+	}
+	logValues = append(logValues, "sample_order", orderLogValue)
+
 	level.Info(logger).Log(
 		logValues...,
 	)
@@ -337,8 +346,8 @@ func RecordRangeAndInstantQueryMetrics(
 	chunkDownloadedTotal.WithLabelValues(status, queryType, rt).
 		Add(float64(stats.TotalChunksDownloaded()))
 	ingesterLineTotal.Add(float64(stats.Ingester.TotalLinesSent))
-	if order := sampleOrderLabel(stats.Summary.StreamFirstSubqueries, stats.Summary.TimestampFirstSubqueries); order != "" {
-		querySampleOrder.WithLabelValues(order, rt).Inc()
+	if sampleOrder != "" {
+		querySampleOrder.WithLabelValues(sampleOrder, rt).Inc()
 	}
 
 	recordUsageStats(queryType, stats)
