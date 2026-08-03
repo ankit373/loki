@@ -21,6 +21,7 @@ import (
 	"github.com/grafana/loki/v3/pkg/logproto"
 	"github.com/grafana/loki/v3/pkg/logql/syntax"
 	"github.com/grafana/loki/v3/pkg/logqlmodel"
+	logql_stats "github.com/grafana/loki/v3/pkg/logqlmodel/stats"
 	"github.com/grafana/loki/v3/pkg/querier/plan"
 	"github.com/grafana/loki/v3/pkg/storage/chunk/cache/resultscache"
 	"github.com/grafana/loki/v3/pkg/util"
@@ -328,6 +329,17 @@ func (ev *DefaultEvaluator) NewIterator(ctx context.Context, expr syntax.LogSele
 	return ev.querier.SelectLogs(ctx, params)
 }
 
+// recordSampleOrderSubquery counts one range-aggregation sub-evaluation in the query stats under
+// the sample order it ran in.
+func recordSampleOrderSubquery(ctx context.Context, order logproto.SampleOrder) {
+	st := logql_stats.FromContext(ctx)
+	if order == logproto.SAMPLE_ORDER_BY_STREAM {
+		st.IncStreamFirstSubqueries()
+		return
+	}
+	st.IncTimestampFirstSubqueries()
+}
+
 func (ev *DefaultEvaluator) NewStepEvaluator(
 	ctx context.Context,
 	nextEvFactory SampleEvaluatorFactory,
@@ -347,6 +359,7 @@ func (ev *DefaultEvaluator) NewStepEvaluator(
 			sampleOrder := getSampleOrderForExpr(ev.streamOrderedExecutionEnabled, rangExpr)
 
 			nextEvFactory = SampleEvaluatorFunc(func(ctx context.Context, _ SampleEvaluatorFactory, _ syntax.SampleExpr, _ Params) (StepEvaluator, error) {
+				recordSampleOrderSubquery(ctx, sampleOrder)
 				it, err := ev.querier.SelectSamples(ctx, SelectSampleParams{
 					&logproto.SampleQueryRequest{
 						// extend startTs backwards by step
@@ -378,6 +391,7 @@ func (ev *DefaultEvaluator) NewStepEvaluator(
 		// only selects the stream-first read/merge path (per-stream store reads and the querier's
 		// cross-source dedup); it never changes the output.
 		sampleOrder := getSampleOrderForExpr(ev.streamOrderedExecutionEnabled, e)
+		recordSampleOrderSubquery(ctx, sampleOrder)
 
 		it, err := ev.querier.SelectSamples(ctx, SelectSampleParams{
 			&logproto.SampleQueryRequest{

@@ -18,6 +18,7 @@ import (
 	"github.com/grafana/loki/v3/pkg/iter"
 	"github.com/grafana/loki/v3/pkg/logproto"
 	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
 )
 
 // streamFirstTestSamples is a per-stream sample set with varied values and timestamps, so
@@ -587,4 +588,28 @@ func BenchmarkRangeVectorIterator(b *testing.B) {
 			}
 		})
 	}
+}
+
+// TestEngineRecordsSampleOrderStats asserts the engine records the resolved sample order into the
+// query stats: stream-first sub-evaluations when the flag is on for a decomposable op, timestamp-
+// first when off. This covers the stats plumbing (evaluator decision -> stats context -> Result).
+func TestEngineRecordsSampleOrderStats(t *testing.T) {
+	run := func(streamOrdered bool) logqlmodel.Result {
+		eng := NewEngine(EngineOpts{StreamOrderedExecutionEnabled: streamOrdered},
+			fixedSamplesQuerier{samples: streamFirstTestSamples}, NoLimits, log.NewNopLogger())
+		params, err := NewLiteralParams(`count_over_time({app="foo"}[30s])`,
+			time.Unix(40, 0), time.Unix(120, 0), 10*time.Second, 0, logproto.FORWARD, 0, nil, nil)
+		require.NoError(t, err)
+		res, err := eng.Query(params).Exec(user.InjectOrgID(context.Background(), "fake"))
+		require.NoError(t, err)
+		return res
+	}
+
+	on := run(true)
+	require.Positive(t, on.Statistics.Summary.StreamFirstSubqueries, "flag on: stream-first sub-evaluations recorded")
+	require.Zero(t, on.Statistics.Summary.TimestampFirstSubqueries, "flag on: no timestamp-first sub-evaluations")
+
+	off := run(false)
+	require.Positive(t, off.Statistics.Summary.TimestampFirstSubqueries, "flag off: timestamp-first sub-evaluations recorded")
+	require.Zero(t, off.Statistics.Summary.StreamFirstSubqueries, "flag off: no stream-first sub-evaluations")
 }

@@ -107,6 +107,18 @@ func TestSampleQueryStreamOrderingEquivalence(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "vector", resp.Data.ResultType)
 
+		// The query-stats summary must record the ordering the engine actually used: stream-first
+		// sub-evaluations when the flag is on (count_over_time is decomposable), timestamp-first
+		// otherwise. This exercises the stats plumbing end to end (engine decision -> response stats).
+		sum := resp.Data.Statistics.Summary
+		if streamOrdered {
+			require.Positive(t, sum.StreamFirstSubqueries, "stream-first run must record stream-first sub-evaluations")
+			require.Zero(t, sum.TimestampFirstSubqueries, "stream-first run must record no timestamp-first sub-evaluations")
+		} else {
+			require.Positive(t, sum.TimestampFirstSubqueries, "timestamp-first run must record timestamp-first sub-evaluations")
+			require.Zero(t, sum.StreamFirstSubqueries, "timestamp-first run must record no stream-first sub-evaluations")
+		}
+
 		got := map[string]float64{}
 		for _, s := range resp.Data.Vector {
 			v, err := strconv.ParseFloat(s.Value, 64)
