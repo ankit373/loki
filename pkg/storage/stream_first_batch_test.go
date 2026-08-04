@@ -13,6 +13,7 @@ import (
 	"github.com/grafana/loki/v3/pkg/iter"
 	"github.com/grafana/loki/v3/pkg/logproto"
 	"github.com/grafana/loki/v3/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
 	"github.com/grafana/loki/v3/pkg/storage/config"
 )
 
@@ -117,6 +118,46 @@ func TestNewStreamFirstSampleBatchIterator(t *testing.T) {
 				require.Lessf(t, streamFirstEntries[i-1].hash, streamFirstEntries[i].hash, "streamHash not ascending at %d", i)
 			}
 		}
+	})
+
+	t.Run("tracks decompressed bytes and lines like the timestamp-first iterator", func(t *testing.T) {
+		// The stream-first iterator delegates per-stream decoding to the timestamp-first iterator on
+		// the query context, so reordering streams must not change what the query decompresses. Feed
+		// both paths the same chunks and require the store chunk stats to match, and to be non-zero so
+		// a path that silently records nothing fails. Head-chunk bytes stay zero: the store reads
+		// flushed (compressed) chunks, so those bytes are an ingester concern, not a store one.
+		buildChunks := func() []*LazyChunk {
+			return []*LazyChunk{
+				newLazyChunk(chunkfmt, headfmt, mkStream("b", 1, 2, 3)),
+				newLazyChunk(chunkfmt, headfmt, mkStream("a", 1, 2, 3)),
+				newLazyChunk(chunkfmt, headfmt, mkStream("c", 1, 2, 3)),
+			}
+		}
+		drainStoreStats := func(t *testing.T, build func(ctx context.Context) (iter.SampleIterator, error)) stats.Result {
+			statsCtx, ctx := stats.NewContext(context.Background())
+			it, err := build(ctx)
+			require.NoError(t, err)
+			for it.Next() { //nolint:revive // draining the iterator is the point.
+			}
+			require.NoError(t, it.Err())
+			require.NoError(t, it.Close())
+			return statsCtx.Result(0, 0, 0)
+		}
+
+		timestampFirstStats := drainStoreStats(t, func(ctx context.Context) (iter.SampleIterator, error) {
+			return newTimestampFirstSampleBatchIterator(ctx, schemaConfig, NilMetrics, buildChunks(), 10, matchers, start, end, nil, newEx())
+		}).Querier.Store.Chunk
+		streamFirstStats := drainStoreStats(t, func(ctx context.Context) (iter.SampleIterator, error) {
+			return streamFirst(ctx, buildChunks(), 10, 0, fetchLazyChunks)
+		}).Querier.Store.Chunk
+
+		require.Positive(t, timestampFirstStats.DecompressedBytes, "sanity: the timestamp-first path must decompress something")
+		require.Positive(t, timestampFirstStats.DecompressedLines)
+		require.Equal(t, timestampFirstStats.DecompressedBytes, streamFirstStats.DecompressedBytes, "stream-first must decompress the same bytes")
+		require.Equal(t, timestampFirstStats.DecompressedLines, streamFirstStats.DecompressedLines, "stream-first must decompress the same lines")
+		require.Equal(t, timestampFirstStats.HeadChunkBytes, streamFirstStats.HeadChunkBytes)
+		require.Zero(t, timestampFirstStats.HeadChunkBytes, "store path reads flushed chunks, so it records no head-chunk bytes")
+		require.Zero(t, streamFirstStats.HeadChunkBytes, "store path reads flushed chunks, so it records no head-chunk bytes")
 	})
 
 	t.Run("reads non-overlapping chunks across multiple batches in order", func(t *testing.T) {
