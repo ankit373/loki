@@ -807,10 +807,18 @@ func fetchLazyChunks(ctx context.Context, s config.SchemaConfig, chunks []*LazyC
 		return lastErr
 	}
 
+	var unfilled int
 	for _, c := range chunks {
 		if c.Chunk.Data != nil {
 			c.IsValid = true
+		} else {
+			unfilled++
 		}
+	}
+	// A chunk left without Data stays IsValid==false and is silently skipped by the readers, so an
+	// under-filled fetch drops data. Surface it: this is the signal for the stream-first under-count.
+	if unfilled > 0 {
+		level.Warn(logger).Log("msg", "fetchLazyChunks left chunks unfetched; readers will skip them", "unfilled", unfilled, "requested", len(chunks))
 	}
 	return nil
 }
