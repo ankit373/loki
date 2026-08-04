@@ -718,10 +718,22 @@ func filterSeriesByMatchers(
 			filteredChks += len(grp)
 		}
 	}
+	var logged int
 outer:
 	for fp, chunks := range chks {
 		for _, matcher := range matchers {
 			if !matcher.Matches(chunks[0][0].Chunk.Metric.Get(matcher.Name)) {
+				// Diagnostic: reveal why the first chunk fails the matcher — an empty/missing label
+				// value or an undecoded chunk points at the stream-first per-stream re-filter dropping
+				// valid series. Sample a few per call to keep the volume bounded.
+				if logged < 5 {
+					level.Warn(util_log.Logger).Log("msg", "filterSeriesByMatchers discard",
+						"matcher", matcher.String(), "name", matcher.Name,
+						"got", chunks[0][0].Chunk.Metric.Get(matcher.Name),
+						"metric", chunks[0][0].Chunk.Metric.String(),
+						"dataNil", chunks[0][0].Chunk.Data == nil)
+					logged++
+				}
 				removeSeries(fp, chunks)
 				continue outer
 			}
