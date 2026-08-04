@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"time"
 
@@ -651,16 +652,16 @@ func (it *sampleBatchIterator) buildHeapIterator(
 	return iter.NewTimestampFirstMergeSampleIterator(it.ctx, result), nil
 }
 
+// removeMatchersByName returns the matchers with every matcher whose name is in names removed. It
+// does not modify the input slice.
 func removeMatchersByName(matchers []*labels.Matcher, names ...string) []*labels.Matcher {
-	for _, omit := range names {
-		for i := range matchers {
-			if matchers[i].Name == omit {
-				matchers = append(matchers[:i], matchers[i+1:]...)
-				break
-			}
+	out := make([]*labels.Matcher, 0, len(matchers))
+	for _, m := range matchers {
+		if !slices.Contains(names, m.Name) {
+			out = append(out, m)
 		}
 	}
-	return matchers
+	return out
 }
 
 func fetchChunkBySeries(
@@ -718,22 +719,10 @@ func filterSeriesByMatchers(
 			filteredChks += len(grp)
 		}
 	}
-	var logged int
 outer:
 	for fp, chunks := range chks {
 		for _, matcher := range matchers {
 			if !matcher.Matches(chunks[0][0].Chunk.Metric.Get(matcher.Name)) {
-				// Diagnostic: reveal why the first chunk fails the matcher — an empty/missing label
-				// value or an undecoded chunk points at the stream-first per-stream re-filter dropping
-				// valid series. Sample a few per call to keep the volume bounded.
-				if logged < 5 {
-					level.Warn(util_log.Logger).Log("msg", "filterSeriesByMatchers discard",
-						"matcher", matcher.String(), "name", matcher.Name,
-						"got", chunks[0][0].Chunk.Metric.Get(matcher.Name),
-						"metric", chunks[0][0].Chunk.Metric.String(),
-						"dataNil", chunks[0][0].Chunk.Data == nil)
-					logged++
-				}
 				removeSeries(fp, chunks)
 				continue outer
 			}
@@ -799,12 +788,6 @@ func fetchLazyChunks(ctx context.Context, s config.SchemaConfig, chunks []*LazyC
 				return
 
 			}
-			// Diagnostic: a chunk is left unfilled (and later silently skipped) when either duplicate
-			// external keys collapse in the index map (requested > uniqueKeys), or FetchChunks returns
-			// fewer chunks than the unique keys asked for (returned < uniqueKeys).
-			if len(index) < len(chunks) || len(chks) < len(index) {
-				level.Warn(logger).Log("msg", "fetchLazyChunks fill gap", "requested", len(chunks), "uniqueKeys", len(index), "returned", len(chks))
-			}
 			// assign fetched chunk by key as FetchChunks doesn't guarantee the order.
 			for _, chk := range chks {
 				index[s.ExternalKey(chk.ChunkRef)].Chunk = chk
@@ -825,18 +808,10 @@ func fetchLazyChunks(ctx context.Context, s config.SchemaConfig, chunks []*LazyC
 		return lastErr
 	}
 
-	var unfilled int
 	for _, c := range chunks {
 		if c.Chunk.Data != nil {
 			c.IsValid = true
-		} else {
-			unfilled++
 		}
-	}
-	// A chunk left without Data stays IsValid==false and is silently skipped by the readers, so an
-	// under-filled fetch drops data. Surface it: this is the signal for the stream-first under-count.
-	if unfilled > 0 {
-		level.Warn(logger).Log("msg", "fetchLazyChunks left chunks unfetched; readers will skip them", "unfilled", unfilled, "requested", len(chunks))
 	}
 	return nil
 }

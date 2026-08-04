@@ -7,15 +7,117 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
 
 	"github.com/grafana/loki/v3/pkg/iter"
 	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql"
 	"github.com/grafana/loki/v3/pkg/logql/log"
 	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
+	"github.com/grafana/loki/v3/pkg/querier/astmapper"
 	"github.com/grafana/loki/v3/pkg/storage/config"
 )
+
+// TestSelectSamplesStreamFirstMatchesTimestampFirst drives the full store SelectSamples path — real
+// fetcher, chunk cache, Data==nil ref chunks — with many streams, exactly the production shape. The
+// stream-first order must return the same number of samples as timestamp-first; a silent chunk skip
+// shows as fewer samples.
+func TestSelectSamplesStreamFirstMatchesTimestampFirst(t *testing.T) {
+	periodConfig := config.PeriodConfig{From: config.DayTime{Time: 0}, Schema: "v11"}
+	chunkfmt, headfmt, err := periodConfig.ChunkFormat()
+	require.NoError(t, err)
+
+	const (
+		streamCount     = 150
+		chunksPerStream = 3
+		logsPerChunk    = 5
+	)
+
+	var (
+		streams      []*logproto.Stream
+		totalSamples = streamCount * chunksPerStream * logsPerChunk
+		query        = `count_over_time({foo=~".+"}[1m])`
+		start, end   = time.Unix(0, 0), time.Unix(0, int64(chunksPerStream*logsPerChunk+1))
+	)
+
+	// Many fingerprints, each spanning several contiguous chunks (the shape a broad selector produces),
+	// so a stream's chunks straddle prefetch batches and the batcher splits streams.
+	for i := 0; i < streamCount; i++ {
+		for k := 0; k < chunksPerStream; k++ {
+			entries := make([]logproto.Entry, logsPerChunk)
+			for j := range entries {
+				ts := int64(k*logsPerChunk+j) + 1 // contiguous across a stream's chunks
+				entries[j] = logproto.Entry{Timestamp: time.Unix(0, ts), Line: "a very compressible log line duh"}
+			}
+			streams = append(streams, &logproto.Stream{Labels: fmt.Sprintf(`{foo="bar",id="%d"}`, i), Entries: entries})
+		}
+	}
+
+	selectSamples := func(t *testing.T, order logproto.SampleOrder, shards []astmapper.ShardAnnotation) int {
+		st := &LokiStore{
+			chunkMetrics: NilMetrics,
+			cfg:          Config{MaxChunkBatchSize: 50},
+			Store:        newMockChunkStore(chunkfmt, headfmt, streams),
+		}
+		_, ctx := stats.NewContext(user.InjectOrgID(context.Background(), "fake"))
+		req := newSampleQuery(query, start, end, shards, nil)
+		req.Order = order
+		it, err := st.SelectSamples(ctx, logql.SelectSampleParams{SampleQueryRequest: req})
+		require.NoError(t, err)
+		var n int
+		for it.Next() {
+			n++
+		}
+		require.NoError(t, it.Err())
+		require.NoError(t, it.Close())
+		return n
+	}
+
+	tsSamples := selectSamples(t, logproto.SAMPLE_ORDER_BY_TIMESTAMP, nil)
+	sfSamples := selectSamples(t, logproto.SAMPLE_ORDER_BY_STREAM, nil)
+
+	require.Equal(t, totalSamples, tsSamples, "sanity: timestamp-first must read every sample")
+	require.Equal(t, tsSamples, sfSamples, "stream-first dropped samples")
+
+	// A sharded request injects a __cortex_shard__ matcher (via req.Shards). The reader must strip it
+	// before filtering series by matchers — no chunk carries that label — so a shard must not change
+	// the sample count relative to the unsharded run for either order.
+	t.Run("with a shard annotation", func(t *testing.T) {
+		shard := []astmapper.ShardAnnotation{{Shard: 0, Of: 1}} // 0_of_1 selects everything
+		tsSharded := selectSamples(t, logproto.SAMPLE_ORDER_BY_TIMESTAMP, shard)
+		sfSharded := selectSamples(t, logproto.SAMPLE_ORDER_BY_STREAM, shard)
+		require.Equal(t, totalSamples, tsSharded, "sanity: sharded timestamp-first must read every sample")
+		require.Equal(t, totalSamples, sfSharded, "sharded stream-first dropped samples (shard matcher not stripped?)")
+	})
+
+	// The querier feeds the store iterator into a cross-source merge alongside other sources. Exercise
+	// that multi-iterator merge (two disjoint stores) so its Outer/dedup loop is hit, not the single
+	// iterator shortcut.
+	t.Run("through cross-source stream-first merge", func(t *testing.T) {
+		_, ctx := stats.NewContext(user.InjectOrgID(context.Background(), "fake"))
+		half := len(streams) / 2
+		selectSamples := func(t *testing.T, ss []*logproto.Stream) iter.SampleIterator {
+			st := &LokiStore{chunkMetrics: NilMetrics, cfg: Config{MaxChunkBatchSize: 50}, Store: newMockChunkStore(chunkfmt, headfmt, ss)}
+			req := newSampleQuery(query, start, end, nil, nil)
+			req.Order = logproto.SAMPLE_ORDER_BY_STREAM
+			it, err := st.SelectSamples(ctx, logql.SelectSampleParams{SampleQueryRequest: req})
+			require.NoError(t, err)
+			return it
+		}
+		merged := iter.NewStreamFirstMergeSampleIterator(ctx, []iter.SampleIterator{
+			selectSamples(t, streams[:half]), selectSamples(t, streams[half:]),
+		})
+		var n int
+		for merged.Next() {
+			n++
+		}
+		require.NoError(t, merged.Err())
+		require.NoError(t, merged.Close())
+		require.Equal(t, totalSamples, n, "cross-source stream-first merge dropped samples")
+	})
+}
 
 func TestNewStreamFirstSampleBatchIterator(t *testing.T) {
 	periodConfig := config.PeriodConfig{From: config.DayTime{Time: 0}, Schema: "v11"}
