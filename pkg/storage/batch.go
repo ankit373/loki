@@ -787,6 +787,12 @@ func fetchLazyChunks(ctx context.Context, s config.SchemaConfig, chunks []*LazyC
 				return
 
 			}
+			// Diagnostic: a chunk is left unfilled (and later silently skipped) when either duplicate
+			// external keys collapse in the index map (requested > uniqueKeys), or FetchChunks returns
+			// fewer chunks than the unique keys asked for (returned < uniqueKeys).
+			if len(index) < len(chunks) || len(chks) < len(index) {
+				level.Warn(logger).Log("msg", "fetchLazyChunks fill gap", "requested", len(chunks), "uniqueKeys", len(index), "returned", len(chks))
+			}
 			// assign fetched chunk by key as FetchChunks doesn't guarantee the order.
 			for _, chk := range chks {
 				index[s.ExternalKey(chk.ChunkRef)].Chunk = chk
